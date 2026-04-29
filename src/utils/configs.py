@@ -1,18 +1,30 @@
-import math
-from os.path import join
-import numpy as np
-import yaml
-from easydict import EasyDict as edict
+# Module: Central configuration constants for data, model, loss, and training.
+
+try:
+    from easydict import EasyDict as edict
+except ImportError:
+    # Class: Fallback EasyDict-compatible dictionary for attribute-style config access.
+    class edict(dict):
+        # Function: Provide attribute-style reads for config dictionary keys.
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        # Function: Provide attribute-style writes for config dictionary keys.
+        def __setattr__(self, name, value):
+            self[name] = value
 
 
 #########################################################################
 # Configuration of Dataset and Data Loader
 #########################################################################
+# Class: String keys used when passing tensors and metadata through the pipeline.
 class DataDict:
     pose = "pose"
     time = "time"
     camera = "camera"
-    scan = "scan"
     local_map = "local_map"
     all_paths = "all_paths"
     targets = "targets"
@@ -35,11 +47,9 @@ class DataDict:
     images = "images"
     running_time = "running_time"
     ori_trajectories = "ori_trajectories"
-    traversability_gt = "traversability_gt"
 
     prediction = "prediction"
     time_steps = "time_steps"
-    traversable_step = "traversable_step"
     predict_path = "predict_path"
     ground_truth = "ground_truth"
     embedding = "embedding"
@@ -49,31 +59,30 @@ class DataDict:
     noise = "noise"
     all_trajectories = "all_trajectories"
     all_variances = "all_variances"
-    traversability_pred = "traversability_pred"
-    traversability_mu = "traversability_mu"
-    traversability_var = "traversability_var"
 
     A = "A"
     b = "b"
 
+# Class: Supported camera identifiers.
 class CameraType:
     realsense_d435i = 0
     realsense_l515 = 1
 
 
+# Class: Dataset split names.
 class DatasetType:
     test = "test"
     train = "train"
 
+# Class: Generator backend identifiers.
 class GeneratorType:
     diffusion = 0
-
 
 DatasetConfig = edict()  # Configuration of data loaders
 DatasetConfig.name = ""
 # DatasetConfig.root = ""
-DatasetConfig.train_root = "/home/isr-lab3/Faryal_Batool/Training samples"
-DatasetConfig.val_root   = "/home/isr-lab3/Faryal_Batool/Validation_samples"
+DatasetConfig.train_root = "/home/dzmitry/Faryal_Batool/Thesis/Training samples"
+DatasetConfig.val_root   = "/home/dzmitry/Faryal_Batool/Thesis/Validation_samples"
 DatasetConfig.batch_size = 32
 DatasetConfig.num_workers = 4
 DatasetConfig.shuffle = False
@@ -87,29 +96,9 @@ DatasetConfig.imu_num = 0
 #########################################################################
 # Configuration of Models
 #########################################################################
-class RNNType:
-    gru = 0
-    lstm = 1
-
-
+# Class: Supported diffusion backbone identifiers.
 class DiffusionModelType:
     unet = "unet"
-    crnn = "crnn"
-
-
-class CRNNType:
-    lstm = "lstm"
-    gru = "gru"
-
-
-Perception = edict()
-Perception.fix_perception = False
-Perception.vel_dim = 20
-Perception.vel_out = 256
-
-CRNN = edict()
-CRNN.type = CRNNType.gru
-CRNN.waypoint_num = 16
 
 Diffusion = edict()
 Diffusion.beta_start = 0.0001
@@ -119,55 +108,36 @@ Diffusion.clip_sample = True  # default clip range = 1
 Diffusion.clip_sample_range = 1.0  # default clip range = 1
 Diffusion.num_train_timesteps = 100
 Diffusion.variance_type = "fixed_small"
-Diffusion.perception_in = 0
 Diffusion.diffusion_zd = 512
 Diffusion.waypoint_dim = 2
 Diffusion.waypoints_num = 128 #16
 Diffusion.use_goal = True
-# (optional, if you want a start heatmap)
 Diffusion.add_heatmaps = False
-Diffusion.rnn_type = RNNType.gru
-Diffusion.rnn_output_threshold = 1
 Diffusion.diffusion_step_embed_dim = 256
 Diffusion.down_dims = [64, 128, 256, 512]  #[512, 1024, 2048]
 Diffusion.kernel_size = 5
 Diffusion.cond_predict_scale = True
-Diffusion.use_traversability = False
-Diffusion.estimate_traversability = False
-Diffusion.traversable_steps = None
-Diffusion.traversable_steps_buffer = 5
 Diffusion.n_groups = 8
 Diffusion.model_type = DiffusionModelType.unet
 Diffusion.use_all_paths = False
 Diffusion.sample_times = -1
-Diffusion.crnn = CRNN
 
 ModelConfig = edict()
 ModelConfig.generator_type = GeneratorType.diffusion
 ModelConfig.diffusion = Diffusion
-ModelConfig.perception = Perception
 ModelConfig.scale_waypoints = 1.0 #1.0
 
 
 #########################################################################
 # Configuration of Loss
 #########################################################################
-class Hausdorff:
-    average = "average"
-    max = "max"
-
-
+# Class: Metric and loss dictionary key names.
 class LossNames:
     path_dis = "path_dis"
     last_dis = "last_dis"
-    traversability = "traversability"
-    est_tra_rec = "est_tra_rec"
-    est_tra_kld = "est_tra_kld"
 
     evaluate_last_dis = "evaluate_last_dis"
     evaluate_path_dis = "evaluate_path_dis"
-    evaluate_traversability = "evaluate_traversability"
-    evaluate_estimation_traversability = "evaluate_estimation_traversability"
 
     loss = "loss"
 
@@ -175,13 +145,9 @@ class LossNames:
 LossConfig = edict()
 LossConfig.train_poses = False
 LossConfig.scale_waypoints = 1.0 # 1.0
-LossConfig.use_traversability = False
-LossConfig.distance_type = Hausdorff.average
 LossConfig.distance_ratio = 1 # 10.0
 LossConfig.last_ratio = 2.0 #2.0
-LossConfig.traversability_ratio = 1 # 10.0
 LossConfig.generator_type = ModelConfig.generator_type
-LossConfig.traversability_estimation_reconstruct_ratio = 10.0
 LossConfig.root = ""
 
 LossConfig.endpoint_ratio = 1.0
@@ -195,16 +161,19 @@ LossConfig.output_dir = None
 #########################################################################
 # Configuration of Training
 #########################################################################
+# Class: Supported learning-rate scheduler names.
 class ScheduleMethods:
     step = "step"
     cosine = "cosine"
 
 
+# Class: TensorBoard scalar key names.
 class LogNames:
     step_time = "step_time"
     lr = "learning_rate"
 
 
+# Class: Logging split names.
 class LogTypes:
     train = "train"
     others = "evaluation"
@@ -226,7 +195,6 @@ TrainingConfig.weight_decay = 0
 TrainingConfig.lr_t0 = 1
 TrainingConfig.lr_tm = 5
 TrainingConfig.lr_min = 1e-7
-TrainingConfig.traversability_threshold = 1e-7
 
 TrainingConfig.gpus = edict()
 TrainingConfig.gpus.channels_last = False

@@ -1,22 +1,4 @@
-"""
-Diffusion model for trajectory generation with traversability-based conditioning.
-
-This module implements a Denoising Diffusion Probabilistic Model (DDPM) for generating
-trajectory masks conditioned on traversability maps and start/goal positions. The model
-diffuses 2D masks representing start points, goal points, and trajectory paths, then
-learns to denoise them back to clean masks.
-
-Key Components:
-- DDPM scheduler for noise addition/removal
-- Conditional U-Net backbone for denoising
-- DiPPeR-style encoders for traversability and coordinate conditioning
-- Inpainting during sampling to maintain known start/goal positions
-
-Architecture:
-- Input: Traversability map + start/goal pixel coordinates
-- Output: 3-channel mask (start, goal, trajectory) in pixel space
-- Conditioning: Encoded traversability + coordinate features → global latent vector
-"""
+# Module: DDPM mask-planning model and sampling logic.
 
 import torch
 from torch import nn
@@ -24,41 +6,43 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from src.models.backbones.unet import ConditionalUnet1D   # 2D UNet over (B,C,H,W)
-from src.utils.configs import DataDict, DiffusionModelType
+from src.utils.configs import DataDict
 
-# DiPPeR-style conditioning blocks
 from src.models.perception import DiPPERImageEncoder, DiPPERStartGoalEncoder
 
 
+# Class: DDPM trajectory-mask planner with training and sampling routines.
 class Diffusion(nn.Module):
     """
-    DDPM-based trajectory generation model with traversability conditioning.
+    DDPM over 2D masks (start / goal / trajectory) with RGB conditioning.
 
-    This model implements denoising diffusion over 2D trajectory masks, where:
-    - The diffused variable is a 3-channel mask: [start_mask, goal_mask, trajectory_mask]
-    - Conditioning comes from traversability maps and start/goal pixel coordinates
-    - The U-Net predicts clean masks directly (x₀-prediction mode)
+    - Main visual input: RGB image of shape (B,3,H,W)
+    - Diffused variable:  mask `mask_gt` of shape (B,3,H,W)
+        ch0 = start mask
+        ch1 = goal mask
+        ch2 = trajectory mask
 
-    Training Process:
-    1. Start with ground-truth trajectory mask x₀
-    2. Add noise: xₜ = √ᾱₜ·x₀ + √(1-ᾱₜ)·ε
-    3. U-Net predicts x̂₀ from xₜ
-    4. Loss: ||x̂₀ - x₀||²
+    Conditioning:
+        rgb + start_px + end_px -> global_cond (zd) via image + coordinate encoders.
 
-    Sampling Process:
-    1. Start with random noise xₜ
-    2. Iteratively denoise using reverse diffusion
-    3. Inpaint known start/goal positions at each step
-    4. Output final clean trajectory mask
+    Training (prediction_type="sample"):
+        - x_0 = mask_gt (pixel-space trajectory mask)
+        - Add noise with scheduler.add_noise(x_0, noise, t)
+        - UNet predicts x_0 (clean mask) directly
+        - Loss compares x0_pred vs mask_gt in pixel space
+
+    Sampling:
+        - Start/goal pixels are treated as known and inpainted at each step.
+        - The sampled output is a mask in pixel space (B,3,H,W).
     """
 
+    # Function: Initialize module layers, configuration fields, and runtime state.
     def __init__(self, cfg, activation_func=nn.Softsign):
         super(Diffusion, self).__init__()
 
-        self.model_type = cfg.model_type
         self.use_all_paths = cfg.use_all_paths
         self.sample_times = cfg.sample_times
-        self.num_train_timesteps = 100
+        self.num_train_timesteps = cfg.num_train_timesteps
 
         # ------------------------------------------------------------------
         # DDPM scheduler: x0-prediction ("sample")
@@ -75,10 +59,6 @@ class Diffusion(nn.Module):
         )
         self.time_steps = self.num_train_timesteps
 
-        self.use_traversability = cfg.use_traversability
-        self.estimate_traversability = cfg.estimate_traversability
-        self.traversable_steps = cfg.traversable_steps
-
         self.use_goal = True
         self.add_heatmaps = False
 
@@ -89,7 +69,7 @@ class Diffusion(nn.Module):
         self.mask_channels = 3          # start / goal / traj
 
         # ------------------------------------------------------------
-        # 1) Traversability encoder → ResNet-18-like (DiPPeR style)
+        # 1) RGB encoder -> ResNet-18-like (DiPPeR style)
         # ------------------------------------------------------------
         self.img_enc = DiPPERImageEncoder(out_dim=img_feat)
 
@@ -100,7 +80,7 @@ class Diffusion(nn.Module):
         self.goal_enc  = DiPPERStartGoalEncoder(in_dim=2, out_dim=sg_dim)
 
         # ------------------------------------------------------------
-        # 3) Fuse [img_feat + sg_dim(start) + sg_dim(goal)] → zd
+        # 3) Fuse [img_feat + sg_dim(start) + sg_dim(goal)] -> zd
         # ------------------------------------------------------------
         Act = (lambda: activation_func()) if activation_func is not None else (lambda: nn.LeakyReLU(0.2))
 
@@ -115,42 +95,29 @@ class Diffusion(nn.Module):
         # ------------------------------------------------------------
         # 4) Diffusion backbone = 2D UNet over masks
         # ------------------------------------------------------------
-        if self.model_type == DiffusionModelType.unet:
-            self.diff_model = ConditionalUnet1D(
-                input_dim=self.mask_channels,       # C = 3 (start/goal/traj)
-                global_cond_dim=self.zd,            # global condition vector
-                diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
-                down_dims=cfg.down_dims,
-                kernel_size=cfg.kernel_size,
-                cond_predict_scale=cfg.cond_predict_scale,
-                n_groups=cfg.n_groups,
-            )
-        elif self.model_type == DiffusionModelType.crnn:
-            raise NotImplementedError(
-                "RNNDiffusion (crnn) is not supported in the new mask-based setup. "
-                "Use DiffusionModelType.unet instead."
-            )
-        else:
-            raise Exception("the diffusion model type is not defined")
+        self.diff_model = ConditionalUnet1D(
+            input_dim=self.mask_channels,       # C = 3 (start/goal/traj)
+            global_cond_dim=self.zd,            # global condition vector
+            diffusion_step_embed_dim=cfg.diffusion_step_embed_dim,
+            down_dims=cfg.down_dims,
+            kernel_size=cfg.kernel_size,
+            cond_predict_scale=cfg.cond_predict_scale,
+            n_groups=cfg.n_groups,
+        )
 
     # ------------------------------------------------------------------
-    # Helper: pixels → normalized [0,1] for conditioning MLP
+    # Helper: pixels -> normalized [0,1] for conditioning MLP
     # ------------------------------------------------------------------
     @staticmethod
+    # Function: Convert pixel coordinates into normalized [0, 1] coordinates.
     def _px_to_norm(xy_px: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """
         Convert pixel coordinates (x_px,y_px) in [0,W-1]x[0,H-1]
         to normalized coordinates (x_norm,y_norm) in [0,1]^2.
 
-        This is ONLY for conditioning encoders. The mask itself stays in pixel grid.
-
-        Args:
-            xy_px: Pixel coordinates tensor (B, 2) or (2,).
-            H: Image height in pixels.
-            W: Image width in pixels.
-
-        Returns:
-            torch.Tensor: Normalized coordinates in [0,1] range.
+        xy_px: (B,2) or (2,)
+        NOTE: This is ONLY for conditioning encoders.
+            The mask itself stays on the pixel grid.
         """
         if xy_px.dim() == 1:
             xy_px = xy_px[None, :]  # (1,2)
@@ -165,25 +132,21 @@ class Diffusion(nn.Module):
         return torch.clamp(xy_norm, 0.0, 1.0)
 
     # ------------------------------------------------------------------
-    # Conditioning builder: TRAV + start_px + end_px → global condition
+    # Conditioning builder: RGB + start_px + end_px -> global condition
     # ------------------------------------------------------------------
+    # Function: Build the global DDPM conditioning vector from image and endpoint coordinates.
     def _build_condition_px(self, rgb, start_px, end_px):
         """
-        Build global conditioning vector from traversability map and start/goal coordinates.
+        Global conditioning from:
+            - rgb       : [B,3,H,W]
+            - start_px  : [B,2] (x_px,y_px)
+            - end_px    : [B,2] (x_px,y_px)
 
-        The conditioning pipeline:
-        1. Encode traversability map with ResNet-like encoder
-        2. Normalize start/goal pixel coordinates to [0,1]
-        3. Encode normalized coordinates with MLPs
-        4. Fuse all features through conditioning network
-
-        Args:
-            rgb: Traversability map tensor (B, 1, H, W) or RGB image (B, 3, H, W).
-            start_px: Start point pixel coordinates (B, 2) or (2,).
-            end_px: End point pixel coordinates (B, 2) or (2,).
+        We internally normalize start_px/end_px to [0,1]^2 for the MLPs,
+        but the *mask* remains in pixel grid.
 
         Returns:
-            torch.Tensor: Global conditioning vector (B, zd).
+            h_condition: [B, zd] global conditioning vector.
         """
         B, _, H, W = rgb.shape
 
@@ -202,181 +165,114 @@ class Diffusion(nn.Module):
                 f"start_px B={start_px.size(0)}, end_px B={end_px.size(0)}"
             )
 
-        # 1) Traversability embedding - encode visual features
+        # 1) RGB embedding
         img_g = self.img_enc(rgb)                      # [B, img_feat]
 
-        # 2) Start & goal embeddings - encode normalized coordinates
-        start_norm = self._px_to_norm(start_px, H, W)   # (B,2) normalized [0,1]
-        end_norm   = self._px_to_norm(end_px,   H, W)   # (B,2) normalized [0,1]
+        # 2) Start & goal embeddings (in normalized [0,1]^2 space)
+        start_norm = self._px_to_norm(start_px, H, W)   # (B,2)
+        end_norm   = self._px_to_norm(end_px,   H, W)   # (B,2)
 
         start_g = self.start_enc(start_norm)            # [B, sg_dim]
         goal_g  = self.goal_enc(end_norm)               # [B, sg_dim]
 
-        # 3) Fuse all conditioning features
+        # 3) Fuse
         fused = torch.cat([img_g, start_g, goal_g], dim=1)  # [B, img_feat + 2*sg_dim]
         h = self.encoder(fused)                             # [B, zd]
-        h_condition = self.trajectory_condition(h)          # [B, zd] (optional transformation)
+        h_condition = self.trajectory_condition(h)          # [B, zd]
 
         return h_condition
-
 
     # ------------------------------------------------------------------
     # Noise helpers for masks
     # ------------------------------------------------------------------
+    # Function: Sample Gaussian noise matching the DDPM mask tensor shape.
     def _add_mask_noise(self, mask: torch.Tensor) -> torch.Tensor:
         """
-        Sample Gaussian noise ε for a mask x_0.
+        Sample Gaussian noise for a mask x_0.
 
-        Args:
-            mask: Input mask tensor (B, 3, H, W).
-
-        Returns:
-            torch.Tensor: Gaussian noise with same shape as input, ~ N(0, I).
+        mask: (B,3,H,W)
+        returns: noise with same shape, ~ N(0, I)
         """
         return torch.randn(mask.shape, device=mask.device)
 
-    def _sample_timesteps(self, x: torch.Tensor, traversable_steps=None) -> torch.Tensor:
-        """
-        Sample diffusion time steps for each batch element.
-
-        If traversable_steps is provided, restrict timesteps to that range.
-        Otherwise sample from full range [0, T).
-
-        Args:
-            x: Input tensor to determine batch size.
-            traversable_steps: Optional restricted timestep range.
-
-        Returns:
-            torch.Tensor: Sampled timesteps (B,).
-        """
-        if self.use_traversability and traversable_steps is not None:
-            time_steps = traversable_steps
-        else:
-            time_steps = self.time_steps
-
+    # Function: Sample diffusion time steps for a training batch.
+    def _sample_timesteps(self, x: torch.Tensor) -> torch.Tensor:
         time_step = torch.randint(
-            0, time_steps, (x.shape[0],),
+            0, self.time_steps, (x.shape[0],),
             device=x.device
         ).long()
         return time_step
 
-    def add_mask_step_noise(self, x_0: torch.Tensor, traversable_step=None):
+    # Function: Add scheduler noise to clean ground-truth masks.
+    def add_mask_step_noise(self, x_0: torch.Tensor):
         """
-        Add DDPM noise to ground-truth mask and optionally create second branch.
+        Adds DDPM noise to the GT mask.
 
-        For traversability conditioning, creates two noisy versions:
-        - First branch: standard noise addition
-        - Second branch: noise addition with restricted timesteps
-
-        Args:
-            x_0: Ground-truth mask (B, 3, H, W) in pixel space.
-            traversable_step: Optional restricted timestep for second branch.
-
+        Input:
+            x_0:              (B,3,H,W) ground-truth mask (x_0 in pixel space)
         Returns:
-            tuple: (noisy_x, noise, time_step) where noisy_x may be (2B, ...) if traversability is used.
+            noisy_x : (B,3,H,W)
+            noise   : (B,3,H,W)
+            time_step: (B,)
         """
         noise = self._add_mask_noise(x_0)
         time_step = self._sample_timesteps(x_0)
 
-        # Add noise using scheduler: x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * noise
         noisy_x = self.noise_scheduler.add_noise(
             original_samples=x_0,
             noise=noise,
             timesteps=time_step
         )
 
-        # If using traversability, create second branch with different noise/timesteps
-        if self.use_traversability:
-            x_0b = x_0.clone()
-            noise_b = self._add_mask_noise(x_0b)
-
-            if traversable_step is None:
-                traversable_step = self.traversable_steps
-
-            time_step_b = self._sample_timesteps(x_0b, traversable_steps=traversable_step)
-
-            noisy_x_b = self.noise_scheduler.add_noise(
-                original_samples=x_0b,
-                noise=noise_b,
-                timesteps=time_step_b
-            )
-
-            # Concatenate both branches
-            noise = torch.cat((noise, noise_b), dim=0)
-            time_step = torch.cat((time_step, time_step_b), dim=0)
-            noisy_x = torch.cat((noisy_x, noisy_x_b), dim=0)
-
         return noisy_x, noise, time_step
 
     # ------------------------------------------------------------------
-    # TRAINING FORWARD: rgb + start_px + end_px → x0 (mask) prediction
+    # TRAINING FORWARD: rgb + start_px + end_px -> x0 (mask) prediction
     # ------------------------------------------------------------------
+    # Function: Run the module forward pass for training or encoding.
     def forward(self,
                 rgb,
-                # trav,
                 mask_gt,
                 start_px,
-                end_px,
-                traversable_step=None,
-                occ_map=None,
-                start_norm=None,
-                end_norm=None):
+                end_px):
         """
-        Training forward pass: predict clean mask from noisy mask.
+        Training forward.
 
-        Process:
-        1. Build global conditioning from traversability + coordinates
-        2. Add noise to ground-truth mask x₀ → xₜ
-        3. U-Net predicts x̂₀ from xₜ
-        4. Return prediction for loss computation
-
-        Args:
-            rgb: Traversability map or RGB image (B, 1/3, H, W).
-            mask_gt: Ground-truth trajectory mask (B, 3, H, W).
-            start_px: Start point pixel coordinates (B, 2) or (2,).
-            end_px: End point pixel coordinates (B, 2) or (2,).
-            traversable_step: Optional timestep restriction for traversability.
-            occ_map: Optional occupancy map (not used in current implementation).
-            start_norm: Optional normalized start coordinates (legacy).
-            end_norm: Optional normalized end coordinates (legacy).
+        Inputs:
+            rgb     : [B,3,H,W]
+            mask_gt : [B,3,H,W] ground-truth mask in pixel space (x_0)
+            start_px: [B,2] or (2,), pixel coords (x_px,y_px)
+            end_px  : [B,2] or (2,), pixel coords (x_px,y_px)
 
         Returns:
-            dict: Contains predicted masks, noise, and timesteps for loss computation.
+            {
+            DataDict.prediction: x0_pred  (B,3,H,W)  # model's x_0 estimate
+            DataDict.noise     : noise    (B,3,H,W)  # noise used to build x_t
+            DataDict.time_steps: time_step(B,)       # t for each sample
+            }
         """
         assert mask_gt is not None, "Diffusion.forward: mask_gt is required."
-        # assert trav is not None,    "Diffusion.forward: trav is required."
         assert start_px is not None and end_px is not None, \
             "Diffusion.forward: start_px and end_px are required."
-
-        # Move inputs to same device
         rgb = rgb.to(mask_gt.device)
-        # trav = trav.to(mask_gt.device)
         start_px = start_px.to(mask_gt.device)
         end_px   = end_px.to(mask_gt.device)
 
         B, C, H, W = mask_gt.shape
         assert C == self.mask_channels, f"mask_gt should have {self.mask_channels} channels, got {C}"
 
-        # 1) Build global conditioning from traversability + coordinates
+        # 1) Build global conditioning from rgb + start_px + end_px (coords normalized inside)
         h_condition = self._build_condition_px(rgb, start_px, end_px)  # [B, zd]
 
-        # 2) Add noise to ground-truth mask x₀
-        noisy_mask, noise, time_step = self.add_mask_step_noise(
-            x_0=mask_gt,
-            traversable_step=traversable_step
-        )
+        # 2) Add noise to GT mask x_0
+        noisy_mask, noise, time_step = self.add_mask_step_noise(x_0=mask_gt)
 
-        # 3) If using traversability (2B case), duplicate condition to match batch
-        global_cond = h_condition
-        if self.use_traversability:
-            global_cond = torch.cat([h_condition, h_condition], dim=0)
-
-        # 4) U-Net predicts clean mask x₀ directly (prediction_type="sample")
+        # 3) Diffusion UNet predicts x_0 (clean mask) directly (prediction_type="sample")
         x0_pred = self.diff_model(
             noisy_mask,
             time_step,
             local_cond=None,
-            global_cond=global_cond
+            global_cond=h_condition
         )
 
         # ---- SAFETY: ensure prediction spatial size matches GT mask ----
@@ -389,28 +285,25 @@ class Diffusion(nn.Module):
                 align_corners=False)
 
         return {
-            DataDict.prediction: x0_pred,       # x₀ prediction, (B or 2B, 3, H, W)
-            DataDict.noise: noise,              # ε used for noise addition (optional for loss)
-            DataDict.time_steps: time_step,     # t for each sample
+            DataDict.prediction: x0_pred,       # x_0 prediction, (B,3,H,W)
+            DataDict.noise: noise,              # Gaussian noise used to build x_t
+            DataDict.time_steps: time_step,
         }
 
     # ------------------------------------------------------------------
-    # SAMPLING: trav + start_px + end_px → sampled mask (with inpainting)
+    # SAMPLING: rgb + start_px + end_px -> sampled mask (with inpainting)
     # ------------------------------------------------------------------
     @torch.no_grad()
+    # Function: Run DDPM reverse sampling to produce a trajectory mask.
     def sample(self,
             rgb,
-            # trav,
             start_px,
-            end_px,
-            occ_map=None,
-            start_norm=None,
-            end_norm=None):
+            end_px):
         """
         Inference / sampling in mask space with inpainting of start/goal pixels.
 
         Inputs:
-            trav    : [B,1,H,W]
+            rgb     : [B,3,H,W]
             start_px: [B,2] or (2,), pixel coords (x_px,y_px)
             end_px  : [B,2] or (2,), pixel coords (x_px,y_px)
 
@@ -420,7 +313,7 @@ class Diffusion(nn.Module):
             DataDict.all_trajectories: list of x_0 predictions (if use_all_paths=True)
             }
         """
-        assert rgb is not None, "Diffusion.sample: 'trav' is required."
+        assert rgb is not None, "Diffusion.sample: 'rgb' is required."
         assert start_px is not None and end_px is not None, \
             "Diffusion.sample: start_px and end_px are required."
 
@@ -451,6 +344,7 @@ class Diffusion(nn.Module):
         known_mask_x0 = torch.zeros_like(mask_sample)  # (B,3,H,W)
 
         # Helper: pixel coords -> clamped indices
+        # Function: Clamp pixel coordinates into valid tensor indices.
         def px_to_indices(xy_px):
             if xy_px.dim() == 1:
                 xy_px = xy_px[None, :]
@@ -473,7 +367,7 @@ class Diffusion(nn.Module):
         for b in range(B):
             inpaint_mask[b, 0, sy[b], sx[b]] = 0.0   # fix start pixel
             inpaint_mask[b, 1, gy[b], gx[b]] = 0.0   # fix goal pixel
-        # Traj channel fully unknown → remains all ones
+        # Traj channel fully unknown, so it remains all ones.
 
         # noise for known endpoints (for q(x_t | x_0_known))
         noise_known = torch.randn_like(mask_sample)
@@ -520,16 +414,14 @@ class Diffusion(nn.Module):
             )
             mask_sample = step.prev_sample.contiguous()
 
-            # Inpainting: fix known start/goal pixels using q(x_t | x_0_known)
+            # Inpainting: overwrite known pixels with q(x_t | x_0_known)
             t_idx = int(t.item())
             alpha_bar = alphas_cumprod[t_idx]
             sqrt_alpha_bar = alpha_bar.sqrt().view(1, 1, 1, 1)
             sqrt_one_minus = (1.0 - alpha_bar).sqrt().view(1, 1, 1, 1)
 
-            # q(x_t | x_0_known) = sqrt(ᾱₜ)*x₀_known + sqrt(1-ᾱₜ)*ε
+            # q(x_t | x_0_known) = sqrt(alpha_bar)*x_0_known + sqrt(1-alpha_bar)*noise
             known_noisy = sqrt_alpha_bar * known_mask_x0 + sqrt_one_minus * noise_known
-
-            # Blend: unknown pixels from diffusion, known pixels from q(x_t | x_0_known)
             mask_sample = inpaint_mask * mask_sample + (1.0 - inpaint_mask) * known_noisy
 
             if self.use_all_paths:

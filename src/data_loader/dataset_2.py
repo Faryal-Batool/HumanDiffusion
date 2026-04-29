@@ -1,10 +1,4 @@
-"""
-Dataset module for trajectory prediction and diffusion models.
-
-This module provides a PyTorch Dataset class for loading and preprocessing trajectory data,
-including RGB images, occupancy maps, traversability maps, and trajectory masks.
-Supports both hard and soft trajectory rendering for diffusion model training.
-"""
+# Module: Dataset and rasterization utilities for RGB-conditioned mask training.
 
 # dataset.py
 import json
@@ -15,62 +9,24 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 # ------------------------------
-# Helper Functions for Data Loading
+# Helpers
 # ------------------------------
 
+# Function: Load an RGB image as a numpy array.
 def load_rgb(path: Path) -> np.ndarray:
-    """
-    Load RGB image from file path.
-
-    Args:
-        path: Path to the RGB image file.
-
-    Returns:
-        np.ndarray: RGB image as numpy array with shape (H, W, 3) and dtype uint8.
-    """
     img = Image.open(path).convert("RGB")
     return np.asarray(img, dtype=np.uint8)
 
+# Function: Load an occupancy image as a grayscale numpy array.
 def load_occ(path: Path) -> np.ndarray:
-    """
-    Load occupancy map from image file.
-
-    Args:
-        path: Path to the occupancy map image file.
-
-    Returns:
-        np.ndarray: Occupancy map as grayscale numpy array with dtype uint8.
-    """
     img = Image.open(path)
     if img.mode in ("RGB", "RGBA"):
         img = img.convert("L")
     return np.asarray(img, dtype=np.uint8)
 
-def load_trav(path: Path) -> np.ndarray:
-    """
-    Load traversability map from numpy file.
-
-    Args:
-        path: Path to the traversability map .npy file.
-
-    Returns:
-        np.ndarray: Traversability map as float32 numpy array.
-    """
-    arr = np.load(path)
-    return np.squeeze(arr).astype(np.float32)
-
+# Function: Resize a numpy image to the model square resolution.
 def resize_np(img: np.ndarray, size: int, is_gray: bool = False) -> np.ndarray:
-    """
-    Resize numpy image to square dimensions using bilinear interpolation.
-
-    Args:
-        img: Input image array.
-        size: Target size for both width and height.
-        is_gray: Whether the image is grayscale (affects channel handling).
-
-    Returns:
-        np.ndarray: Resized image array.
-    """
+    """Resize numpy image to (size,size)."""
     if img.ndim == 2 or is_gray:
         pil = Image.fromarray(img)
         pil = pil.resize((size, size), resample=Image.BILINEAR)
@@ -79,46 +35,26 @@ def resize_np(img: np.ndarray, size: int, is_gray: bool = False) -> np.ndarray:
     pil = pil.resize((size, size), resample=Image.BILINEAR)
     return np.asarray(pil)
 
+# Function: Load one normalized point from a JSON file.
 def load_point01(json_path: Path):
-    """
-    Load normalized point coordinates from JSON file.
-
-    Args:
-        json_path: Path to JSON file containing point coordinates.
-
-    Returns:
-        tuple: (x, y) coordinates as floats in [0,1] range.
-    """
     with open(json_path, "r") as f:
         pt = json.load(f)
     return float(pt["x"]), float(pt["y"])
 
+# Function: Clip normalized coordinates into the [0, 1] range.
 def clamp01(x: np.ndarray) -> np.ndarray:
-    """
-    Clamp array values to [0, 1] range.
-
-    Args:
-        x: Input array.
-
-    Returns:
-        np.ndarray: Clamped array.
-    """
     return np.clip(x, 0.0, 1.0)
 
+# Function: Normalize trajectory coordinate ordering and optional y-axis flipping.
 def traj_to_norm01(traj: np.ndarray, order: str = "yx", flip_y: bool = False) -> np.ndarray:
     """
-    Convert trajectory coordinates to normalized [0,1] space with configurable ordering.
-
-    Args:
-        traj: Input trajectory array of shape (N, 2) with normalized coordinates.
-        order: Coordinate ordering - "xy" for (x,y) or "yx" for (y,x).
-        flip_y: Whether to flip Y coordinates (y := 1 - y).
-
-    Returns:
-        np.ndarray: Normalized trajectory with shape (N, 2) in (x,y) format.
-
-    Raises:
-        ValueError: If trajectory format is invalid or coordinates appear to be in pixel space.
+    traj: (N,2) normalized [0,1], stored either as (x,y) or (y,x)
+    order:
+      - "xy": traj[:,0]=x, traj[:,1]=y
+      - "yx": traj[:,0]=y, traj[:,1]=x  (your planner case)
+    flip_y:
+      - True: y := 1 - y
+    returns: (N,2) normalized (x,y) clipped to [0,1]
     """
     t = np.asarray(traj, dtype=np.float32)
     if t.ndim != 2 or t.shape[1] != 2:
@@ -143,20 +79,11 @@ def traj_to_norm01(traj: np.ndarray, order: str = "yx", flip_y: bool = False) ->
     return np.clip(xy, 0.0, 1.0)
 
 
+# Function: Resample a polyline at approximately uniform arclength intervals.
 def resample_by_arclength(traj01: np.ndarray, n: int) -> np.ndarray:
     """
-    Resample trajectory to n points with approximately equal arc-length spacing.
-
-    This function redistributes points along the trajectory so that they are
-    roughly equally spaced by arc length, which is important for consistent
-    representation in diffusion models.
-
-    Args:
-        traj01: Input trajectory with shape (N, 2) in normalized [0,1] coordinates.
-        n: Number of points to resample to.
-
-    Returns:
-        np.ndarray: Resampled trajectory with shape (n, 2).
+    Resample polyline in normalized space to n points, roughly equal arc-length.
+    Keeps it float (no rounding).
     """
     t = np.asarray(traj01, dtype=np.float32)
     if len(t) == 0:
@@ -179,21 +106,12 @@ def resample_by_arclength(traj01: np.ndarray, n: int) -> np.ndarray:
     return clamp01(out)
 
 # ------------------------------
-# Rasterization Functions for Trajectory Rendering
+# Rasterization: line drawing
 # ------------------------------
 
+# Function: Paint a soft Gaussian blob into a single-channel mask.
 def splat_gaussian(mask2d: np.ndarray, cx: float, cy: float, sigma: float = 0.9, cutoff: float = 3.0):
-    """
-    Add a soft Gaussian blob to a 2D mask at the specified center position.
-
-    Used for rendering soft start/goal points in trajectory masks.
-
-    Args:
-        mask2d: 2D mask array to modify in-place.
-        cx, cy: Center coordinates in pixel space.
-        sigma: Standard deviation of the Gaussian in pixels.
-        cutoff: Cutoff factor for the Gaussian window (affects rendering radius).
-    """
+    """Soft blob centered at (cx,cy) in pixel coords on a single-channel mask."""
     H, W = mask2d.shape
     rad = max(1, int(np.ceil(cutoff * sigma)))
     x0 = max(0, int(np.floor(cx)) - rad)
@@ -213,17 +131,9 @@ def splat_gaussian(mask2d: np.ndarray, cx: float, cy: float, sigma: float = 0.9,
     mask2d[y0:y1 + 1, x0:x1 + 1] = patch
 
 
+# Function: Paint a small hard endpoint marker into a single-channel mask.
 def paint_hard_disk(mask2d: np.ndarray, cx: float, cy: float, r: int = 1):
-    """
-    Paint a hard disk (filled circle approximation) onto a 2D mask.
-
-    Used for rendering hard start/goal points in trajectory masks.
-
-    Args:
-        mask2d: 2D mask array to modify in-place.
-        cx, cy: Center coordinates in pixel space.
-        r: Radius of the disk in pixels.
-    """
+    """Hard disk / square-ish stamp for start/goal."""
     H, W = mask2d.shape
     xi = int(round(cx))
     yi = int(round(cy))
@@ -233,15 +143,12 @@ def paint_hard_disk(mask2d: np.ndarray, cx: float, cy: float, r: int = 1):
     y1 = min(H - 1, yi + r)
     mask2d[y0:y1 + 1, x0:x1 + 1] = 1.0
 
+# Function: Rasterize a hard line segment into a mask.
 def draw_line_hard(mask: np.ndarray, x0, y0, x1, y1, thickness: int = 1):
     """
-    Draw a hard (binary) line segment onto a mask by sampling points along the line.
-
-    Args:
-        mask: 2D mask array to draw on (modified in-place).
-        x0, y0: Starting point coordinates.
-        x1, y1: Ending point coordinates.
-        thickness: Line thickness in pixels.
+    Draw a connected hard line segment onto mask using simple sampling.
+    mask: HxW float32 or uint8
+    x0,y0,x1,y1: float pixel coords
     """
     H, W = mask.shape
     dx = x1 - x0
@@ -263,18 +170,11 @@ def draw_line_hard(mask: np.ndarray, x0, y0, x1, y1, thickness: int = 1):
         mask[y_min:y_max+1, x_min:x_max+1] = 1.0
 
 
+# Function: Rasterize a soft anti-aliased line segment into a mask.
 def draw_line_soft(mask: np.ndarray, x0, y0, x1, y1, sigma: float = 0.75, cutoff: float = 3.0):
     """
-    Draw an anti-aliased (soft) line by placing Gaussian blobs along the segment.
-
-    This creates smoother trajectory visualizations suitable for diffusion models.
-
-    Args:
-        mask: 2D mask array to draw on (modified in-place).
-        x0, y0: Starting point coordinates.
-        x1, y1: Ending point coordinates.
-        sigma: Standard deviation for Gaussian smoothing in pixels.
-        cutoff: Cutoff factor for Gaussian window size.
+    Draw an anti-aliased (soft) line by splatting Gaussians along the segment.
+    sigma in pixels; cutoff controls window size ~ cutoff*sigma.
     """
     H, W = mask.shape
     dx = x1 - x0
@@ -309,23 +209,12 @@ def draw_line_soft(mask: np.ndarray, x0, y0, x1, y1, sigma: float = 0.75, cutoff
         mask[y0i:y1i + 1, x0i:x1i + 1] = patch
 
 
+# Function: Convert a normalized trajectory polyline into a mask channel.
 def rasterize_traj_mask(traj01: np.ndarray, size: int, mode: str = "soft",
                         thickness: int = 1, sigma: float = 0.75) -> np.ndarray:
     """
-    Convert a normalized trajectory into a rasterized mask image.
-
-    This function takes a trajectory in normalized [0,1] coordinates and renders it
-    as either a hard or soft mask, suitable for use as conditioning in diffusion models.
-
-    Args:
-        traj01: Trajectory points with shape (N, 2) in normalized [0,1] coordinates.
-        size: Output mask size (both width and height).
-        mode: Rendering mode - "hard" for binary masks or "soft" for anti-aliased.
-        thickness: Line thickness for hard mode (in pixels).
-        sigma: Gaussian sigma for soft mode (in pixels).
-
-    Returns:
-        np.ndarray: Rasterized mask with shape (size, size) and values in [0,1].
+    traj01: (N,2) normalized [0,1] floats
+    returns mask: (size,size) float32 in [0,1]
     """
     H = W = size
     mask = np.zeros((H, W), dtype=np.float32)
@@ -357,37 +246,22 @@ def rasterize_traj_mask(traj01: np.ndarray, size: int, mode: str = "soft",
 
 
 # ------------------------------
-# Main Dataset Class
+# Dataset
 # ------------------------------
 
+# Class: Dataset that loads RGB samples, endpoints, trajectories, and DDPM mask targets.
 class TrajMaskDataset(Dataset):
     """
-    PyTorch Dataset for trajectory prediction with mask-based conditioning.
-
-    This dataset loads trajectory data along with RGB images, occupancy maps,
-    and traversability maps. It provides both hard and soft trajectory rendering
-    options suitable for diffusion model training.
-
-    Expected data structure per sample:
-    - sample_XXXXX/
-        - rgb.png: RGB image
-        - occ_map.png: Occupancy map (optional)
-        - trav_map.npy: Traversability map (optional)
-        - start_xy.json: Start point coordinates
-        - end_xy.json: End point coordinates
-        - traj_xy.npy: Trajectory points
-
-    Output format:
-        - rgb: RGB image tensor (3, H, W) in [0,1]
-        - occ: Occupancy map tensor (1, H, W) in [0,1] (if available)
-        - trav: Traversability map tensor (1, H, W) (if available)
-        - start_px: Start point in pixel coordinates (2,) int64
-        - end_px: End point in pixel coordinates (2,) int64
-        - traj_px: Trajectory points in pixel coordinates (N, 2) int64
-        - mask_gt: Ground truth mask (3, H, W) with start/goal/trajectory channels
-        - traj_01: Trajectory in normalized coordinates (N, 2) float32
+    Outputs are consistent with typical structure:
+      - rgb:   (3, S, S) float32 in [0,1]
+      - occ:   (1, S, S) float32 in [0,1]  (if exists)
+      - start_px, end_px: int64 [2] pixel coords in SxS space (x,y)
+      - start_01, end_01: float32 [2] normalized coords
+      - traj_01: (N,2) float32 normalized polyline
+      - traj_mask: (1,S,S) float32 in [0,1] (soft or hard)
     """
 
+    # Function: Initialize module layers, configuration fields, and runtime state.
     def __init__(
         self,
         root_dir: str,
@@ -397,25 +271,9 @@ class TrajMaskDataset(Dataset):
         line_thickness: int = 2,        # for hard mode
         soft_sigma: float = 0.75,       # for soft mode
         use_occ: bool = True,
-        use_trav: bool = True,
-        traj_order: str = "yx",
+        traj_order: str = "yx", 
         traj_flip_y: bool = False,
     ):
-        """
-        Initialize the trajectory mask dataset.
-
-        Args:
-            root_dir: Path to the dataset root directory containing sample folders.
-            img_size: Size to resize images to (square).
-            n_points: Number of points to resample trajectories to.
-            traj_mask_mode: "soft" for anti-aliased or "hard" for binary trajectory masks.
-            line_thickness: Thickness of trajectory lines in hard mode.
-            soft_sigma: Gaussian sigma for soft trajectory rendering.
-            use_occ: Whether to load occupancy maps.
-            use_trav: Whether to load traversability maps.
-            traj_order: Coordinate ordering in trajectory files ("xy" or "yx").
-            traj_flip_y: Whether to flip Y coordinates (y := 1 - y).
-        """
         self.root = Path(root_dir)
         self.img_size = int(img_size)
         self.n_points = int(n_points)
@@ -423,35 +281,25 @@ class TrajMaskDataset(Dataset):
         self.line_thickness = int(line_thickness)
         self.soft_sigma = float(soft_sigma)
         self.use_occ = use_occ
-        self.use_trav = use_trav
         self.traj_order = traj_order
         self.traj_flip_y = traj_flip_y
 
-        # Start/goal rendering settings
         self.soft_start_goal = True
         self.start_goal_sigma = 0.9
         # or for hard:
         self.start_goal_radius = 1
 
-        # Discover sample directories
+
         self.samples = sorted([p for p in self.root.iterdir() if p.is_dir() and p.name.startswith("sample_")])
         if len(self.samples) == 0:
             raise RuntimeError(f"No sample_XXXXX folders found in: {self.root}")
 
+    # Function: Return the number of available dataset samples.
     def __len__(self):
-        """Return the number of samples in the dataset."""
         return len(self.samples)
 
+    # Function: Load one dataset sample and prepare tensors for the model.
     def __getitem__(self, idx: int):
-        """
-        Load and preprocess a single sample from the dataset.
-
-        Args:
-            idx: Index of the sample to load.
-
-        Returns:
-            dict: Dictionary containing preprocessed data tensors and metadata.
-        """
         sp = self.samples[idx]
 
         # ---- Load RGB (512) then resize to SxS
@@ -462,42 +310,39 @@ class TrajMaskDataset(Dataset):
 
         # rgb_t = torch.from_numpy(rgb_s).float().permute(2, 0, 1) / 255.0  # (3,S,S)
 
-        # ---- Load optional maps (occupancy and traversability)
+        # ---- Optionals
         occ_t = None
         if self.use_occ and (sp / "occ_map.png").exists():
             occ = load_occ(sp / "occ_map.png")
             occ_s = resize_np(occ, self.img_size, is_gray=True)
             occ_t = torch.from_numpy(occ_s).float().unsqueeze(0) / 255.0  # (1,S,S)
 
-        trav_t = None
-        if self.use_trav and (sp / "trav_map.npy").exists():
-            trav = load_trav(sp / "trav_map.npy")
-            # trav might be float already; resize as float
-            trav_s = resize_np(trav.astype(np.float32), self.img_size, is_gray=True).astype(np.float32)
-            trav_t = torch.from_numpy(trav_s).float().unsqueeze(0)  # (1,S,S)
-
-        # ---- Load start/end points in normalized space (this is the ground truth)
+        # ---- Load start/end in normalized space (this is your source of truth)
         sx01, sy01 = load_point01(sp / "start_xy.json")
         gx01, gy01 = load_point01(sp / "end_xy.json")
+        # start_01 = torch.tensor([sx01, sy01], dtype=torch.float32)
+        # end_01   = torch.tensor([gx01, gy01], dtype=torch.float32)
 
-        # Convert to pixel coordinates in SxS space for consistency
+        # Convert to pixel coords in SxS (consistent with your existing style)
         W = H = self.img_size
         start_px = torch.tensor([int(round(sx01 * (W - 1))), int(round(sy01 * (H - 1)))], dtype=torch.int64)
         end_px   = torch.tensor([int(round(gx01 * (W - 1))), int(round(gy01 * (H - 1)))], dtype=torch.int64)
 
-        # ---- Load and process trajectory
+        # ---- Load trajectory (normalized floats) and resample in normalized space
         traj = np.load(sp / "traj_xy.npy")  # expected normalized [0,1]
+        # traj01 = traj_to_norm01(traj)       # (N,2) float in [0,1]
         traj01 = traj_to_norm01(traj, order=self.traj_order, flip_y=self.traj_flip_y)
         traj01 = resample_by_arclength(traj01, self.n_points)  # (n_points,2) float
         traj_01_t = torch.from_numpy(traj01).float()  # (N,2)
 
-        # ---- Convert trajectory to pixel coordinates for legacy compatibility
+                # ---- Build (N,2) pixel trajectory in SxS for returning (int64) like your old code
         S = self.img_size
         traj_px_float = np.stack([traj01[:, 0] * (S - 1), traj01[:, 1] * (S - 1)], axis=1)
         traj_px_int = np.rint(np.clip(traj_px_float, 0, S - 1)).astype(np.int64)  # (N,2) (x,y)
+
         traj_px_t = torch.from_numpy(traj_px_int).long()
 
-        # ---- Rasterize trajectory into a mask channel
+        # ---- Rasterize trajectory channel (float mask in [0,1])
         traj_mask = rasterize_traj_mask(
             traj01=traj01,
             size=S,
@@ -506,15 +351,17 @@ class TrajMaskDataset(Dataset):
             sigma=self.soft_sigma
         )  # (S,S) float32
 
-        # ---- Build ground truth mask with start/goal/trajectory channels
+        # ---- Build mask_gt: (3,S,S)
         mask_gt = np.zeros((3, S, S), dtype=np.float32)
 
-        # Start/Goal channels: render as soft or hard blobs
+        # start/goal centers in pixel coords (float)
         sx_f = float(sx01) * (S - 1)
         sy_f = float(sy01) * (S - 1)
         gx_f = float(gx01) * (S - 1)
         gy_f = float(gy01) * (S - 1)
 
+        # Start/Goal channels: choose hard or soft blobs
+        # If you want start/goal also soft, use splat_gaussian; otherwise paint_hard_disk.
         if getattr(self, "soft_start_goal", True):
             sg_sigma = float(getattr(self, "start_goal_sigma", 0.9))
             splat_gaussian(mask_gt[0], sx_f, sy_f, sigma=sg_sigma)
@@ -529,30 +376,23 @@ class TrajMaskDataset(Dataset):
 
         mask_gt_t = torch.from_numpy(mask_gt).float()  # (3,S,S)
 
-        # ---- Build output dictionary
         out = {
-            "rgb": rgb_t,              # (3,S,S) RGB image
-            "start_px": start_px,      # (2,) int64 start point in pixels
-            "end_px": end_px,          # (2,) int64 end point in pixels
-            "traj_px": traj_px_t,      # (N,2) int64 trajectory points in pixels
-            "mask_gt": mask_gt_t,      # (3,S,S) ground truth mask (start/goal/traj)
+            "rgb": rgb_t,              # (3,S,S)
+            "start_px": start_px,      # (2,) int64 (x,y)
+            "end_px": end_px,          # (2,) int64 (x,y)
+            "traj_px": traj_px_t,      # (N,2) int64 (x,y)
+            "mask_gt": mask_gt_t,      # (3,S,S) float32 in [0,1] (soft) or {0,1} (hard-ish)
         }
 
-        # Add optional maps if available
-        if trav_t is not None:
-            out["trav"] = trav_t
+        # Keep optional occupancy for overlays/debugging only.
         if occ_t is not None:
             out["occ"] = occ_t
 
-        # Include normalized trajectory for debugging/analysis
-        out["traj_01"] = traj_01_t    # (N,2) normalized trajectory
+        # Optional: return float traj too for debugging
+        out["traj_01"] = traj_01_t    # (N,2)
 
         return out
 
-
-        # =============================================================================
-        # LEGACY CODE - Previous implementation (commented out for reference)
-        # =============================================================================
 
         # # ---- Rasterize trajectory into a mask in SxS
         # traj_mask = rasterize_traj_mask(
@@ -576,10 +416,6 @@ class TrajMaskDataset(Dataset):
         # }
         # if occ_t is not None:
         #     out["occ"] = occ_t
-        # if trav_t is not None:
-        #     out["trav"] = trav_t
-
         # return out
-
 
 

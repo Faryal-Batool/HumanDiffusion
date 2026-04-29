@@ -1,3 +1,5 @@
+# Module: General tensor/device/geometry utility functions.
+
 import random
 
 import numpy as np
@@ -9,6 +11,7 @@ import torch.nn.functional as F
 from copy import deepcopy
 
 
+# Function: Resolve a requested device string into a usable torch.device with CPU fallback when needed.
 def get_device(device: Union[torch.device, str] = "cuda") -> torch.device:
     """
     get the device of the input string or torch.device
@@ -27,6 +30,7 @@ def get_device(device: Union[torch.device, str] = "cuda") -> torch.device:
     return device
 
 
+# Function: Recursively move tensors in nested containers onto the requested device.
 def to_device(x, device):
     """
     put the input to a torch tensor in the given device
@@ -50,6 +54,7 @@ def to_device(x, device):
     return x
 
 
+# Function: Recursively detach tensors and move them to CPU for logging or serialization.
 def release_cuda(x):
     """
     put the torch tensors from cuda to numpy
@@ -74,6 +79,7 @@ def release_cuda(x):
     return x
 
 
+# Function: Apply the inverse of a homogeneous transform to a set of points.
 def inverse_transform(pts, transformation):
     if len(pts.shape) == 1:
         pts = pts[None, :]
@@ -92,6 +98,7 @@ def inverse_transform(pts, transformation):
     return new_pts
 
 
+# Function: Apply a homogeneous transform to a set of points.
 def appy_tranformation(points, transform):
     assert transform.shape[1] == 4 and transform.shape[0] >= 3, "transform shape should be (3,4) or (4,4)"
     assert points.shape[1] == 3, "points shape should be (n,3)"

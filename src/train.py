@@ -1,32 +1,23 @@
-"""
-Training module for trajectory generation models.
+# Module: Python module for the DDPM trajectory-planning project.
 
-This module provides the main training infrastructure for diffusion-based
-trajectory generation using Denoising Diffusion Probabilistic Models (DDPM).
-
-Diffusion models in this project:
-- Generate trajectories as 3-channel pixel masks (start, goal, path)
-- Use mask denoising and reconstruction objectives for training
-
-The Trainer class handles:
-- Multi-GPU training (single GPU and distributed)
-- Mixed precision training
-- TensorBoard logging
-- Model checkpointing
-- Learning rate scheduling
-- Periodic evaluation
-"""
-
+import copy
+import pickle
 import time
 import os
+from os.path import join, exists
+from typing import Tuple
+import subprocess
+
 from warnings import warn
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torch import autocast
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from tqdm import tqdm
 import os.path as osp
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from src.utils.configs import (
     TrainingConfig,
@@ -35,102 +26,79 @@ from src.utils.configs import (
     LogNames,
     LogTypes,
     DataDict,
-    GeneratorType,
 )
 from src.loss import Loss
 from src.models.model import get_model
 from src.utils.functions import to_device, get_device, release_cuda
 from src.data_loader.data_loader import train_data_loader, evaluation_data_loader
+import io
+import numpy as np
+import matplotlib.pyplot as plt
 
 
+# Class: Training orchestration class for model, data, optimizer, logging, and evaluation.
 class Trainer:
-    """
-    Main training driver for trajectory generation models.
-
-    Supports diffusion-based training with unified distributed, logging,
-    checkpointing, and evaluation support.
-
-    For diffusion models (GeneratorType.diffusion):
-    - Dataset provides traversability maps, ground-truth masks, start/goal coordinates
-    - Model performs DDPM over pixel-space masks
-    - Loss is mask-based reconstruction
-    """
-
+    # Function: Initialize module layers, configuration fields, and runtime state.
     def __init__(self, cfgs: TrainingConfig):
         """
-        Initialize the trainer with configuration.
+        Main training driver.
 
-        Sets up model, optimizer, scheduler, data loaders, and distributed training
-        infrastructure based on the provided configuration.
+        DDPM mask planning setup:
 
-        Args:
-            cfgs: Training configuration containing all hyperparameters and settings
+          - Dataset returns per sample:
+                "rgb"     : (3,H,W)  RGB image (for visualization only)
+                "mask_gt" : (3,H,W)  GT mask channels:
+                                  ch0 = start pixel(s)
+                                  ch1 = goal  pixel(s)
+                                  ch2 = trajectory pixels
+                "start_px": (2,)     (x_px, y_px)
+                "end_px"  : (2,)     (x_px, y_px)
+
+          - DataLoader batches give:
+                "rgb"     : (B,3,H,W)
+                "mask_gt" : (B,3,H,W)
+                "start_px": (B,2)
+                "end_px"  : (B,2)
+
+          - HNav/Diffusion take these and perform DDPM over masks in pixel space.
+          - Loss is mask-based x0 reconstruction.
         """
-        # Training configuration
         self.name = cfgs.name
         self.max_epoch = cfgs.max_epoch
         self.evaluation_freq = cfgs.evaluation_freq
-        self.train_time_steps = cfgs.train_time_steps  # Multiple updates per batch (diffusion)
+        self.train_time_steps = cfgs.train_time_steps
+        self.train_poses = cfgs.loss.train_poses
 
-        # Training state
         self.iteration = 0
         self.epoch = 0
         self.training = False
+
         self.global_step = 0
-
-        # Device and distributed training setup
-        self._setup_device_and_distribution(cfgs)
-
-        # Model initialization
-        self._setup_model(cfgs)
-
-        # Logging setup (TensorBoard)
-        self._setup_logging(cfgs)
-
-        # Optimizer and learning rate scheduler
-        self._setup_optimizer_and_scheduler(cfgs)
-
-        # Loss function
-        self._setup_loss(cfgs)
-
-        # Data loaders
-        self._setup_data_loaders(cfgs)
-
-        # Diffusion-specific parameters
-        self.use_traversability = cfgs.loss.use_traversability
-        self.generator_type = cfgs.model.generator_type
-        self.time_step_number = cfgs.model.diffusion.traversable_steps
-
-    def _setup_device_and_distribution(self, cfgs):
-        """Setup device and distributed training configuration."""
+        # set up gpus
         if cfgs.gpus.device == "cuda":
             self.device = "cuda"
         else:
             self.device = get_device(device=cfgs.gpus.device)
-
-        # Check for distributed training environment
         if 'WORLD_SIZE' in os.environ and cfgs.gpus.device == "cuda":
-            world_size = int(os.environ['WORLD_SIZE'])
-            print(f"World size: {world_size}")
-            self.distributed = cfgs.data.distributed = world_size >= 1
+            print("world size: ", int(os.environ['WORLD_SIZE']))
+            self.distributed = cfgs.data.distributed = int(os.environ['WORLD_SIZE']) >= 1
         else:
-            print("World size: 0")
+            print("world size: ", 0)
             self.distributed = cfgs.data.distributed = False
 
-    def _setup_model(self, cfgs):
-        """Initialize model and load snapshot if provided."""
+        # ----------------- Model -----------------
         self.model = get_model(config=cfgs.model, device=self.device)
         self.snapshot = cfgs.snapshot
-
         if self.snapshot:
             state_dict = self.load_snapshot(self.snapshot)
 
         self.current_rank = 0
-        if self.device != torch.device("cpu"):
+        if self.device == torch.device("cpu"):
+            pass
+        else:
             self._set_model_gpus(cfgs.gpus)
 
-    def _setup_logging(self, cfgs):
-        """Setup TensorBoard logging."""
+        # ----------------- Logging: TensorBoard -----------------
         self.output_dir = cfgs.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -138,14 +106,12 @@ class Trainer:
         self.tb_writer = SummaryWriter(log_dir=log_dir)
         print(f"[INFO] TensorBoard logging to: {log_dir}")
 
-    def _setup_optimizer_and_scheduler(self, cfgs):
-        """Setup optimizer and learning rate scheduler."""
+        # ----------------- Optimizer & Scheduler -----------------
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=cfgs.lr,
             weight_decay=cfgs.weight_decay
         )
-
         self.scheduler_type = cfgs.scheduler
         if self.scheduler_type == ScheduleMethods.step:
             self.scheduler = torch.optim.lr_scheduler.StepLR(
@@ -159,39 +125,31 @@ class Trainer:
                 T_mult=cfgs.lr_tm
             )
         else:
-            raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
+            raise ValueError("the current scheduler is not defined")
 
         if self.snapshot and not cfgs.only_model:
-            self.load_learning_parameters(self.snapshot)
+            self.load_learning_parameters(state_dict)
 
-    def _setup_loss(self, cfgs):
-        """Setup loss function."""
+        # ----------------- Loss -----------------
         if self.device == "cuda":
             self.loss_func = Loss(cfg=cfgs.loss).cuda()
         else:
             self.loss_func = Loss(cfg=cfgs.loss).to(self.device)
 
-    def _setup_data_loaders(self, cfgs):
-        """Setup training and evaluation data loaders."""
+        # ----------------- Datasets -----------------
         self.training_data_loader = train_data_loader(cfg=cfgs.data)
         self.evaluation_data_loader = evaluation_data_loader(cfg=cfgs.data)
 
-    def _set_model_gpus(self, cfg):
-        """
-        Setup GPU configuration for single or distributed training.
+        self.generator_type = cfgs.model.generator_type
+        self.time_step_loss_buffer = []
 
-        Handles:
-        - Distributed training initialization (NCCL backend)
-        - Device placement and memory format optimization
-        - Batch normalization synchronization
-        - DistributedDataParallel wrapping
-        """
+    # Function: Configure single-process or distributed GPU execution.
+    def _set_model_gpus(self, cfg):
         if self.distributed:
-            # Initialize distributed training
             rank = int(os.environ["RANK"])
             world_size = int(os.environ['WORLD_SIZE'])
             local_rank = int(os.environ['LOCAL_RANK'])
-            print(f"OS world size: {world_size}, local_rank: {local_rank}, rank: {rank}")
+            print("os world size: {}, local_rank: {}, rank: {}".format(world_size, local_rank, rank))
 
             torch.cuda.set_device(cfg.local_rank)
             dist.init_process_group(
@@ -202,26 +160,22 @@ class Trainer:
             world_size = dist.get_world_size()
             self.current_rank = dist.get_rank()
             print(
-                f'Training in distributed mode with multiple processes, 1 GPU per process. '
-                f'Process {self.current_rank}, total {world_size}.'
+                'Training in distributed mode with multiple processes, 1 GPU per process. '
+                'Process %d, total %d.' % (self.current_rank, world_size)
             )
             dist.barrier()
         else:
-            print('Training with a single process on 1 GPU.')
+            print('Training with a single process on 1 GPUs.')
+        assert self.current_rank >= 0, "rank is < 0"
 
-        assert self.current_rank >= 0, "Rank must be >= 0"
-
-        # Move model to GPU(s)
         if self.distributed:
             self.model.cuda()
         else:
             self.model.to(self.device)
 
-        # Memory format optimization for convolutional networks
         if cfg.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
 
-        # Setup synchronized batch normalization for distributed training
         if self.distributed and cfg.sync_bn:
             assert not cfg.split_bn
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
@@ -231,7 +185,6 @@ class Trainer:
                     'zero initialized BN layers while sync-bn enabled.'
                 )
 
-        # Wrap model with DistributedDataParallel
         if self.distributed:
             if cfg.local_rank == 0:
                 print("Using native Torch DistributedDataParallel.")
@@ -239,9 +192,10 @@ class Trainer:
                 self.model,
                 device_ids=[cfg.local_rank],
                 broadcast_buffers=not cfg.no_ddp_bb,
-                find_unused_parameters=True  # Allow different parameter usage across ranks
+                find_unused_parameters=True
             )
 
+    # Function: Load model weights from a snapshot and report key mismatches.
     def load_snapshot(self, snapshot):
         print('Loading from "{}".'.format(snapshot))
         state_dict = torch.load(snapshot, map_location=torch.device(self.device))
@@ -261,163 +215,112 @@ class Trainer:
         print('Model has been loaded.')
         return state_dict
 
+    # Function: Restore epoch, iteration, optimizer, and scheduler states.
     def load_learning_parameters(self, state_dict):
-        """
-        Load training state from checkpoint (epoch, iteration, optimizer, scheduler).
-
-        Args:
-            state_dict: Checkpoint dictionary containing training state
-        """
         if 'epoch' in state_dict:
             self.epoch = state_dict['epoch']
-            print(f'Epoch has been loaded: {self.epoch}.')
+            print('Epoch has been loaded: {}.'.format(self.epoch))
         if 'iteration' in state_dict:
             self.iteration = state_dict['iteration']
-            print(f'Iteration has been loaded: {self.iteration}.')
+            print('Iteration has been loaded: {}.'.format(self.iteration))
         if 'optimizer' in state_dict and self.optimizer is not None:
             try:
                 self.optimizer.load_state_dict(state_dict['optimizer'])
                 print('Optimizer has been loaded.')
-            except Exception as e:
-                print(f"Failed to load optimizer: {e}")
+            except:
+                print("doesn't load optimizer")
         if 'scheduler' in state_dict and self.scheduler is not None:
             try:
                 self.scheduler.load_state_dict(state_dict['scheduler'])
                 print('Scheduler has been loaded.')
-            except Exception as e:
-                print(f"Failed to load scheduler: {e}")
+            except:
+                print("doesn't load scheduler")
 
+    # Function: Save model, optimizer, scheduler, and progress state to disk.
     def save_snapshot(self, filename):
-        """
-        Save model checkpoint to file.
-
-        Saves both model weights and training state (epoch, iteration, optimizer, scheduler).
-        Only rank 0 saves in distributed training to avoid conflicts.
-
-        Args:
-            filename: Path to save checkpoint
-        """
         if self.distributed:
-            model_state_dict = self.model.module.state_dict()  # Unwrap DDP
+            model_state_dict = self.model.module.state_dict()
         else:
             model_state_dict = self.model.state_dict()
 
-        # Basic checkpoint with model weights
         state_dict = {'state_dict': model_state_dict}
         torch.save(state_dict, filename)
 
-        # Extended checkpoint with training state (only on rank 0)
-        if not self.distributed or (self.distributed and self.current_rank == 0):
-            state_dict['epoch'] = self.epoch
-            state_dict['iteration'] = self.iteration
-            snapshot_filename = osp.join(self.output_dir, f"{self.name}_snapshot.pth.tar")
-            state_dict['optimizer'] = self.optimizer.state_dict()
-            if self.scheduler is not None:
-                state_dict['scheduler'] = self.scheduler.state_dict()
-            torch.save(state_dict, snapshot_filename)
+        # save snapshot with optimizer & scheduler
+        state_dict['epoch'] = self.epoch
+        state_dict['iteration'] = self.iteration
+        snapshot_filename = osp.join(self.output_dir, str(self.name) + 'snapshot.pth.tar')
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        if self.scheduler is not None:
+            state_dict['scheduler'] = self.scheduler.state_dict()
+        torch.save(state_dict, snapshot_filename)
 
+    # Function: Close writers and distributed process groups after training.
     def cleanup(self):
-        """Cleanup training resources (TensorBoard writer, distributed processes)."""
         if self.tb_writer is not None:
             self.tb_writer.close()
         if self.distributed:
             dist.destroy_process_group()
 
+    # Function: Switch the trainer into training mode with gradients enabled.
     def set_train_mode(self):
-        """Set model to training mode with gradients enabled."""
         self.training = True
         self.model.train()
         torch.set_grad_enabled(True)
 
+    # Function: Switch the trainer into evaluation mode with gradients disabled.
     def set_eval_mode(self):
-        """Set model to evaluation mode with gradients disabled."""
         self.training = False
         self.model.eval()
         torch.set_grad_enabled(False)
 
+    # Function: Apply one optimizer update and clear gradients.
     def optimizer_step(self):
-        """Perform optimizer step and reset gradients."""
         self.optimizer.step()
         self.optimizer.zero_grad()
 
+    # Function: Run one train or evaluation batch through model, loss, and logging outputs.
     def step(self, data_dict, train=True) -> dict:
         """
-        Execute one training or evaluation step.
+        One train/eval step.
 
-        Handles diffusion training with appropriate data preprocessing and loss
-        computation.
-
-        For diffusion models:
-        - Input: traversability maps, ground-truth masks, start/goal coordinates
-        - Process: DDPM training on pixel-space masks
-        - Loss: mask denoising reconstruction
-
-        Args:
-            data_dict: Batch of training/evaluation data
-            train: Whether to perform training (True) or evaluation (False)
-
-        Returns:
-            Dictionary containing model outputs and computed losses
+        DDPM mask planning setup:
+        Dataset / DataLoader provide:
+          - "rgb":      (B,3,H,W) RGB image
+          - "mask_gt":  (B,3,H,W) DDPM x0 target mask (start / goal / traj)
+          - "start_px": (B,2)     (x_px,y_px)
+          - "end_px":   (B,2)     (x_px,y_px)
         """
-        # Move data to appropriate device
         data_dict = to_device(data_dict, device=self.device)
 
-        # Legacy compatibility: map "rgb" → DataDict.camera if present
         if "rgb" in data_dict:
             data_dict[DataDict.camera] = data_dict["rgb"]
 
-        # For backwards compatibility: use "trav" also as DataDict.local_map
-        if "trav" in data_dict:
-            trav = data_dict["trav"]  # (B,1,H,W)
-            data_dict[DataDict.local_map] = trav  # continuous [0,1] traversability
-
-        # Extract ground-truth trajectory (may be None for diffusion)
         gt_path = data_dict.get(DataDict.path, None)
 
         if train:
-            # ==================== TRAINING MODE ====================
             output_dict = self.model(data_dict, sample=False)
-
-            # Diffusion branch: mask-based DDPM training
-            # Pass ground-truth mask and occupancy map to loss function
-            if "mask_gt" in data_dict:
-                output_dict["mask_gt"] = data_dict["mask_gt"]  # (B,3,H,W)
-            if "occ_map" in data_dict:
-                output_dict["occ_map"] = data_dict["occ_map"]  # (B,1,H,W)
-
-            # Compute loss using diffusion mask loss
             loss_dict = self.loss_func(output_dict)
             output_dict.update(loss_dict)
 
         else:
-            # ====================== EVALUATION MODE ======================
             output_dict = self.model(data_dict, sample=True)
-
-            # Diffusion evaluation: attach ground-truth for evaluation metrics
             if "mask_gt" in data_dict:
                 output_dict["mask_gt"] = data_dict["mask_gt"]
-            if "occ_map" in data_dict:
-                output_dict["occ_map"] = data_dict["occ_map"]
-
-            # Evaluate without gradients (mask-based for diffusion)
             eval_dict = self.loss_func.evaluate(output_dict)
             if eval_dict:
                 output_dict.update(eval_dict)
 
-        # For diffusion, gt_path is not essential but kept for compatibility/visualization
         if gt_path is not None:
             output_dict["gt_path"] = gt_path
 
         return output_dict
 
+    # Function: Write scalar metrics to TensorBoard.
     def update_log(self, results, timestep=None, log_name=None):
         """
-        Log scalar metrics to TensorBoard.
-
-        Args:
-            results: Dictionary of metric names -> values
-            timestep: Optional step time for performance monitoring
-            log_name: Log category ("train", "evaluation", etc.)
+        Log metrics to TensorBoard.
+        log_name: "train" or "evaluation" (see LogTypes).
         """
         if self.tb_writer is None:
             return
@@ -433,46 +336,36 @@ class Trainer:
             try:
                 scalar = value.item() if hasattr(value, "item") else float(value)
             except Exception:
-                continue  # Skip non-scalar values
+                continue  # skip non-scalars
 
             self.tb_writer.add_scalar(prefix + key, scalar, step)
 
+    # Function: Run one full training epoch.
     def run_epoch(self):
         """
-        Run one complete training epoch over the training dataset.
+        Run one training epoch over the training_data_loader.
 
-        For diffusion models, performs multiple gradient updates per batch
-        (train_time_steps) to increase training stability and sample efficiency.
-
-        Process:
-        1. Iterate through training data loader
-        2. For each batch, perform train_time_steps forward/backward passes
-        3. Log losses and timing to TensorBoard
-        4. Step learning rate scheduler at epoch end
+        NOTE:
+          - For diffusion, we call self.step(...) `train_time_steps` times per
+            batch, as in the original DTG code (this effectively multiplies
+            the number of gradient updates per data batch).
         """
         self.optimizer.zero_grad()
 
         last_time = time.time()
         for iteration, data_dict in enumerate(
-                tqdm(self.training_data_loader, desc=f"Training Epoch {self.epoch}")):
+                tqdm(self.training_data_loader, desc="Training Epoch {}".format(self.epoch))):
             self.iteration += 1
 
-            # Set timestep limit for diffusion traversability sampling
-            # This bounds the noise levels used during training
-            data_dict[DataDict.traversable_step] = self.time_step_number
-
-            # Multiple updates per batch (diffusion-specific)
             for step_iteration in range(self.train_time_steps):
                 output_dict = self.step(data_dict=data_dict, train=True)
                 torch.cuda.empty_cache()
 
-                # Backward pass and optimization
                 output_dict[LossNames.loss].backward()
                 self.optimizer_step()
-
                 optimize_time = time.time()
 
-                # Log training metrics to TensorBoard
+                # Log losses and step time to TensorBoard
                 output_dict = release_cuda(output_dict)
                 self.update_log(
                     results=output_dict,
@@ -480,28 +373,25 @@ class Trainer:
                     log_name=LogTypes.train
                 )
                 last_time = time.time()
-
-        # Step learning rate scheduler at end of epoch
         self.scheduler.step()
 
         if not self.distributed or (self.distributed and self.current_rank == 0):
             os.makedirs('{}/models'.format(self.output_dir), exist_ok=True)
             self.save_snapshot('{}/models/{}_{}.pth'.format(self.output_dir, self.name, self.epoch))
 
+    # Function: Run periodic evaluation over the validation DataLoader.
     def inference_epoch(self):
         """
-        Run periodic evaluation epoch over the evaluation dataset.
+        Periodic evaluation epoch (no gradient) over evaluation_data_loader.
 
-        Only executed every evaluation_freq epochs. Computes evaluation metrics
-        without gradient computation. For diffusion models, evaluates mask-based
-        trajectory generation quality.
-
-        Logs per-batch metrics and computes mean epoch loss for monitoring.
+        For diffusion:
+          - Uses Loss.evaluate in mask space.
+          - Logs per-batch metrics and a mean epoch loss.
         """
         if (self.evaluation_freq > 0) and (self.epoch % self.evaluation_freq == 0) and (self.epoch != 0):
             for iteration, data_dict in enumerate(
                     tqdm(self.evaluation_data_loader,
-                         desc=f"Evaluation Losses Epoch {self.epoch}")):
+                         desc="Evaluation Losses Epoch {}".format(self.epoch))):
                 sum_loss = 0.0
                 count = 0
 
@@ -511,12 +401,11 @@ class Trainer:
                     torch.cuda.synchronize()
                 step_time = time.time()
 
-                # Accumulate loss for mean computation
+                # assume Loss.evaluate added "loss" into output_dict
                 if "loss" in output_dict:
                     sum_loss += output_dict["loss"].item()
                     count += 1
 
-                # Log evaluation metrics
                 output_dict = release_cuda(output_dict)
                 torch.cuda.empty_cache()
                 self.update_log(
@@ -524,49 +413,26 @@ class Trainer:
                     timestep=step_time - start_time,
                     log_name=LogTypes.others
                 )
-
-            # Log mean evaluation loss for the epoch
             if count > 0:
                 mean_eval_loss = sum_loss / count
                 self.tb_writer.add_scalar("evaluation/mean_loss", mean_eval_loss, self.epoch)
 
+    # Function: Execute the full train/evaluate loop.
     def run(self):
         """
-        Execute the complete training loop.
-
-        Training process:
-        1. For each epoch from current_epoch to max_epoch:
-           a. Run evaluation (if enabled and at correct frequency)
-           b. Run training epoch
-           c. Save model checkpoint
-        2. Cleanup resources
-
-        Enables anomaly detection for debugging and handles distributed training
-        sampler epoch setting.
+        Top-level training loop.
         """
-        # Enable anomaly detection for debugging NaN/inf issues
         torch.autograd.set_detect_anomaly(True)
-
         for self.epoch in range(self.epoch, self.max_epoch, 1):
-            # ---- Evaluate BEFORE training each epoch ----
+            # ---- eval BEFORE training each epoch (as in your original code) ----
             self.set_eval_mode()
             self.inference_epoch()
 
-            # ---- Training epoch ----
+            # ---- training ----
             self.set_train_mode()
-
-            # Set epoch for distributed samplers (important for shuffling)
             if self.distributed:
                 self.training_data_loader.sampler.set_epoch(self.epoch)
                 if self.evaluation_freq > 0:
                     self.evaluation_data_loader.sampler.set_epoch(self.epoch)
-
             self.run_epoch()
-
-            # ---- Save checkpoint at end of epoch ----
-            if not self.distributed or (self.distributed and self.current_rank == 0):
-                os.makedirs(f'{self.output_dir}/models', exist_ok=True)
-                self.save_snapshot(f'{self.output_dir}/models/{self.name}_{self.epoch}.pth')
-
-        # Cleanup resources
         self.cleanup()

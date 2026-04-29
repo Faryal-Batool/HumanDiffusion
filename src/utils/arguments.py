@@ -1,10 +1,13 @@
+# Module: Command-line argument parsing and configuration assembly.
+
 import argparse
 import os
 
 import torch
-from src.utils.configs import TrainingConfig, GeneratorType, DiffusionModelType, CRNNType
+from src.utils.configs import TrainingConfig, GeneratorType, DiffusionModelType
 
 
+# Function: Parse command-line arguments used to customize data paths, training, model, and device settings.
 def get_args():
     parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
     parser.add_argument('--name', type=str, default="hnav", help="name of project")
@@ -23,12 +26,9 @@ def get_args():
     parser.add_argument('--workers', type=int, default=4, help="the worker number in the dataloader")
 
     # model args:
-    parser.add_argument('--generator_type', type=int, default=0, help="0: diffusion; 1: cvae")
-    parser.add_argument('--diffusion_model', type=int, default=1, help="0: rnn; 1: unet")
-    parser.add_argument('--crnn_type', type=int, default=0, help="0: gru; 1: lstm")
+    parser.add_argument('--generator_type', type=int, default=0, help="0: diffusion")
+    parser.add_argument('--diffusion_model', type=int, default=1, help="1: unet")
     parser.add_argument('--train_poses', action='store_true', default=False, help="if train poses or increments")
-    parser.add_argument('--use_traversability', action='store_true', default=False, help="if train traversability")
-    parser.add_argument('--traversable_steps', type=int, default=None, help="time steps used for traversability training")
     parser.add_argument('--diffusion_time_steps', type=int, default=100, help="")
 
     # GPUs
@@ -43,6 +43,7 @@ def get_args():
     return parser.parse_args()
 
 
+# Function: Translate parsed arguments into the mutable project configuration object.
 def get_configuration():
     args = get_args()
     cfg = TrainingConfig
@@ -58,27 +59,15 @@ def get_configuration():
     #########################################
     # model configurations
     #########################################
-    if args.generator_type == 0:
-        cfg.model.generator_type = cfg.loss.generator_type = GeneratorType.diffusion
-    elif args.generator_type == 1:
-        cfg.model.generator_type = cfg.loss.generator_type = GeneratorType.cvae
+    if args.generator_type != 0:
+        raise ValueError("Only DDPM diffusion planning is supported.")
+    if args.diffusion_model != 1:
+        raise ValueError("Only the UNet DDPM diffusion model is supported.")
 
-    else:
-        raise Exception("decoder type is not defined")
-
-    if args.diffusion_model == 0:
-        cfg.model.diffusion.model_type = DiffusionModelType.crnn
-        if args.crnn_type == 0:
-            cfg.model.diffusion.crnn.type = CRNNType.gru
-        else:
-            cfg.model.diffusion.crnn.type = CRNNType.lstm
-    elif args.diffusion_model == 1:
-        cfg.model.diffusion.model_type = DiffusionModelType.unet
-    else:
-        raise Exception("diffusion model type is not defined")
+    cfg.model.generator_type = cfg.loss.generator_type = GeneratorType.diffusion
+    cfg.model.diffusion.model_type = DiffusionModelType.unet
 
     cfg.model.diffusion.num_train_timesteps = args.diffusion_time_steps
-    cfg.model.diffusion.traversable_steps = args.traversable_steps
     cfg.loss.train_poses = args.train_poses
     if args.train_poses:
         cfg.loss.scale_waypoints = 20.0

@@ -1,3 +1,5 @@
+# Module: Standalone inference and evaluation utilities for the DDPM planner.
+
 import os
 import csv
 from pathlib import Path
@@ -63,6 +65,7 @@ metrics_csv_path = output_root / "metrics.csv"
 # --------------------------------------------------
 # 5. Helper: increments -> absolute trajectory
 # --------------------------------------------------
+# Function: Convert predicted trajectory increments into absolute normalized coordinates.
 def increments_to_absolute(start_xy: torch.Tensor, inc: torch.Tensor) -> torch.Tensor:
     """
     start_xy: (2,) in [0,1]
@@ -114,7 +117,7 @@ with open(metrics_csv_path, mode="w", newline="") as f_csv:
         rgb_img = np.asarray(rgb_img_pil, dtype=np.float32) / 255.0  # (H,W,3)
 
         occ_img_pil = Image.open(sample_dir / "occ_map.png").convert("L")
-        # normalize to [0,1]; this is your original traversability/occupancy map
+        # normalize to [0,1] for the occupancy-map overlay
         occ_img = np.asarray(occ_img_pil, dtype=np.float32) / 255.0  # (H,W)
 
         # -------- Build model input dict (RGB + start only) --------

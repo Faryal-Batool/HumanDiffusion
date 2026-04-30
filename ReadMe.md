@@ -3,20 +3,20 @@
 
 ---
 
-## Paper
+## Paper 📄
 Accepted at **HRI 2026 (Late Breaking Report)**  
 [Paper PDF](HumanDiffusion_final.pdf)  
 [Poster](HumanDiffusion_Poster.pdf)
 
 ---
 
-## Introduction
+## Introduction 🚁
 
 **HumanDiffusion** is a vision-based trajectory planning framework for human-centered UAV navigation in search-and-rescue scenarios. The main idea of the paper is to generate safe and smooth trajectories directly from RGB observations while conditioning the predicted path on the detected human location. 
 
 ---
 
-## Abstract
+## Abstract 🧠
 
 Reliable human-robot collaboration in emergency scenarios requires autonomous systems that can detect humans, infer navigation goals, and operate safely in dynamic environments.
 
@@ -26,7 +26,7 @@ Trajectories are predicted directly in **pixel space**, ensuring smooth motion w
 
 ---
 
-## Key Contributions
+## Key Contributions ⚡
 
 - **Human-Conditioned Goal Inference**: Navigation goal derived directly from the detected human.
 - **Image-Conditioned Diffusion Planning**: End-to-end trajectory generation from RGB images.
@@ -35,7 +35,7 @@ Trajectories are predicted directly in **pixel space**, ensuring smooth motion w
 
 ---
 
-## System Architecture
+## System Architecture 🏗️
 
 ![Architecture](assets/architecture.png)
 
@@ -48,7 +48,7 @@ The system consists of two core modules:
 
 ---
 
-## Inference Pipeline
+## Inference Pipeline 🔄
 
 ```text
 RGB Image -> Human Detection (YOLO)
@@ -66,20 +66,20 @@ Pixel-Space Trajectory
 
 ---
 
-## Dataset
+## Dataset 📊
 
 - **Total samples:** 9800  
 - **Training:** 8000  
 - **Validation:** 1500  
 - **Test:** 300
 
-### Dataset generation
+### Dataset generation 🧩
 
 As described in the paper, the dataset is built from simulated indoor scenes where RGB observations are paired with traversability or occupancy information and planner-generated trajectories. Human-aware goals are defined from the perceived target location, and ground-truth paths are saved as pixel-space waypoints for diffusion training.
 
 The repository also contains a `testing_samples/` directory with example samples that help verify the expected training-data structure and output format.
 
-### Dataset annotation
+### Dataset annotation 📝
 
 The `dataset_annotation/` folder contains two utilities used to prepare the dataset:
 
@@ -90,9 +90,9 @@ The `dataset_annotation/` folder contains two utilities used to prepare the data
 
 This annotation workflow follows the dataset preparation idea used in the paper: a start position and human-conditioned goal are paired with map information, a planner generates a safe path, and the saved trajectories are then converted into normalized training samples for diffusion learning.
 
-### Dataset annotation workflow
+### Dataset annotation workflow 🛠️
 
-#### Step 1: Annotate trajectories
+#### Step 1: Annotate trajectories ✍️
 
 Run:
 
@@ -139,7 +139,7 @@ Saved files in each `maps/` folder include:
 - `astar_fixed_waypoint_count_start{k}.csv`
 - `astar_normalized_fixed_waypoint_count_start{k}.csv`
 
-#### Step 2: Convert annotations to training samples
+#### Step 2: Convert annotations to training samples 📦
 
 Run:
 
@@ -167,11 +167,11 @@ Each sample contains:
 
 ---
 
-## Diffusion Training Pipeline
+## Diffusion Training Pipeline 🧪
 
 Before training, each scene is transformed into a supervised sample containing an RGB observation, a start point, an endpoint, and a planner-generated reference trajectory. The annotation and conversion scripts in `dataset_annotation/` automate this pipeline and produce normalized trajectory files used by the diffusion model. Each image represents a first-person view of the indoor environment. For every scene, multiple start locations and a single goal location are selected using an annotation interface. Multiple start positions are included to reflect realistic operating conditions, since a drone may begin from any location within the environment. By providing diverse start-goal combinations for the same scene, the dataset encourages the model to learn how to generate a feasible path from a wide range of initial positions to the desired destination. This also helps the diffusion model capture both straight and curved trajectory patterns, improving its generalization across different navigation scenarios.
 
-### Stage 1: Trajectory generation and annotation
+### Stage 1: Trajectory generation and annotation 🗺️
 The first stage builds scene-level annotations by combining RGB, map information, and start-goal selections. A planner then generates a safe path using the occupancy map and start and goal point information that will serve as supervision.
 
 ![Dataset generation step 1](assets/Dataset_generation_01.jpg)
@@ -180,31 +180,31 @@ The first stage builds scene-level annotations by combining RGB, map information
 
 ![Dataset generation step 3](assets/Dataset_generation_03.jpg)
 
-### Stage 2: Sample construction
+### Stage 2: Sample construction 🧱
 
 The generated trajectories are converted into sample folders containing RGB input, optional occupancy and traversability data, normalized waypoints, start and endpoint metadata.
 
-### Stage 3: Diffusion training input preparation
+### Stage 3: Diffusion training input preparation 🎯
 
 These processed samples are then fed into the diffusion training pipeline, where the model learns to reconstruct trajectories directly from image-conditioned context.
 
 ---
 
-## Diffusion Model Formulation
+## Diffusion Model Formulation 🧮
 
-### Forward Process
+### Forward Process ➡️
 
 $$
 x_t = \sqrt{\alpha_t} \, x_0 + \sqrt{1 - \alpha_t} \, \epsilon
 $$
 
-### Reverse Process
+### Reverse Process ⬅️
 
 $$
 x_{t-1} = \mu_t(x_t, \hat{x}_0) + \sigma_t z
 $$
 
-### Training Objective
+### Training Objective 🎯
 
 $$
 \mathcal{L} = \lambda_{\text{path}} L_{\text{path}} + \lambda_{\text{endpoint}} L_{\text{endpoint}}
@@ -217,9 +217,9 @@ Where:
 
 ---
 
-## Results
+## Results 📈
 
-### Simulation Performance
+### Simulation Performance 🧪
 
 | Metric | Value |
 |-------|------|
@@ -231,12 +231,12 @@ Where:
 
 ---
 
-### Real-World Performance
+### Real-World Performance 🌍
 
-#### Experiment 01: Accident Response
+#### Experiment 01: Accident Response 🚑
 ![Experiment 01](assets/real_exp_01.png)
 
-#### Experiment 02: Search & Locate (Occlusion)
+#### Experiment 02: Search & Locate (Occlusion) 🔍
 ![Experiment 02](assets/real_exp_02.png)
 
 | Scenario | Success Rate |
@@ -247,13 +247,13 @@ Where:
 
 ---
 
-## Demo Video
+## Demo Video 🎥
 
 [![Watch Demo](https://img.youtube.com/vi/fHh9eRGh49c/0.jpg)](https://www.youtube.com/watch?v=fHh9eRGh49c)
 
 ---
 
-## Observations
+## Observations 🧾
 
 - Accurate trajectory reconstruction in pixel space.
 - Reliable human-conditioned navigation.
@@ -261,7 +261,7 @@ Where:
 
 ---
 
-## Running the Project
+## Running the Project ▶️
 
 The main project entrypoint is:
 
@@ -271,7 +271,7 @@ python main.py
 
 ---
 
-## Code Structure & Flow
+## Code Structure & Flow 🧩
 
 To understand the project, a useful reading order is:
 
@@ -287,7 +287,7 @@ To understand the project, a useful reading order is:
 
 ---
 
-## Repository Notes
+## Repository Notes 📁
 
 - `dataset_annotation/` contains the refactored annotation and sample-conversion tools.
 - `testing_samples/` contains example samples for quick validation and debugging.
@@ -295,7 +295,7 @@ To understand the project, a useful reading order is:
 
 ---
 
-## Citation
+## Citation 📚
 
 ```bibtex
 @inproceedings{10.1145/3776734.3794549,

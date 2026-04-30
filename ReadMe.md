@@ -294,7 +294,14 @@ To understand the project, a useful reading order is:
 - `assets/` contains architecture, training-pipeline, and evaluation figures used in this README.
 
 ---
+## Acknowledgements
 
+This work was inspired by:
+https://github.com/jingGM/DTG
+
+We reimplemented and extended the approach for our task.
+
+---
 ## Citation 📚
 
 ```bibtex
